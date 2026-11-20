@@ -1,0 +1,79 @@
+name: Verify and update Installer 1.0.32 mirror
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize]
+permissions:
+  contents: write
+jobs:
+  mirror:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'publish-installer-1.0.32'
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      APK_REF: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Verify release and receive the encrypted mirror credential
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          cd "$RUNNER_TEMP"
+          trap 'rm -f mirror-key.pem mirror-pub.pem mirror-envelope.bin' EXIT
+          base=https://reports.lynkhub.ru:8443
+          branch=publish-installer-1.0.32
+          prefix=.release-staging/mirror-1.0.32
+          if gh api "repos/$GH_REPO/contents/$prefix.pub?ref=$branch" --silent 2>/dev/null; then
+            echo "Ephemeral mirror handoff already in progress"
+            exit 0
+          fi
+          git init -q input
+          git -C input fetch --depth=1 "https://github.com/$GH_REPO.git" "$APK_REF"
+          git -C input show FETCH_HEAD:LynkHubInstaller.apk > LynkHubInstaller.apk
+          echo 'e95dc93ab1527c3966b69c82d877b149efbac977eee21942da2f799f6be558cc  LynkHubInstaller.apk' | sha256sum -c -
+          tag=$(gh release view --json tagName -q .tagName)
+          gh release view "$tag" --json assets -q '.assets[].name' | grep -Fx LynkHubInstaller.apk
+          gh release upload "$tag" LynkHubInstaller.apk --clobber
+          mkdir verify
+          gh release download "$tag" -p LynkHubInstaller.apk -D verify
+          cmp LynkHubInstaller.apk verify/LynkHubInstaller.apk
+          echo "Official GitHub installer asset verified"
+          curl -fsS --max-time 20 "$base/dl/latest.json" > before.json
+          jq -e '.hub and .installer.versionCode <= 33' before.json >/dev/null
+          jq '{installer: .installer.versionName, installerCode: .installer.versionCode}' before.json
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out mirror-key.pem 2>/dev/null
+          openssl pkey -in mirror-key.pem -pubout -out mirror-pub.pem
+          gh api -X PUT "repos/$GH_REPO/contents/$prefix.pub" -f branch="$branch" -f message='Publish ephemeral key for installer mirror handoff' -f content="$(base64 -w0 mirror-pub.pem)" --jq '.commit.sha'
+          git init -q handoff
+          for attempt in {1..75}; do
+            if git -C handoff fetch -q --depth=1 "https://github.com/$GH_REPO.git" "$branch" &&
+              git -C handoff show "FETCH_HEAD:$prefix.enc" > mirror-envelope.bin 2>/dev/null &&
+              test "$(wc -c < mirror-envelope.bin)" -eq 384; then
+              break
+            fi
+            sleep 10
+          done
+          test "$(wc -c < mirror-envelope.bin)" -eq 384
+          jq --arg url "$base/dl/LynkHubInstaller.apk" '.installer = {versionName:"1.0.32",versionCode:33,sha256:"e95dc93ab1527c3966b69c82d877b149efbac977eee21942da2f799f6be558cc",url:$url}' before.json > latest.json
+          openssl pkeyutl -decrypt -inkey mirror-key.pem -in mirror-envelope.bin -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 | python3 -c '
+          import pathlib, sys, urllib.request
+          token = sys.stdin.read().strip()
+          if not token or "\\n" in token or "\\r" in token:
+              raise SystemExit("Invalid mirror credential")
+          base = "https://reports.lynkhub.ru:8443"
+          for name in ("LynkHubInstaller.apk", "latest.json"):
+              data = pathlib.Path(name).read_bytes()
+              request = urllib.request.Request(base + "/v1/publish/" + name, data=data, method="PUT",
+                                               headers={"Authorization": "Bearer " + token})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  if not 200 <= response.status < 300:
+                      raise SystemExit("Mirror upload failed")
+          '
+          curl -fsS --max-time 20 "$base/dl/latest.json" > after.json
+          jq -e '.installer.versionName == "1.0.32" and .installer.versionCode == 33 and .installer.sha256 == "e95dc93ab1527c3966b69c82d877b149efbac977eee21942da2f799f6be558cc"' after.json
+          diff <(jq -S '.hub' before.json) <(jq -S '.hub' after.json)
+          curl -fsS --max-time 60 "$base/dl/LynkHubInstaller.apk" -o mirror.apk
+          cmp LynkHubInstaller.apk mirror.apk
+          echo "Mirror APK and installer metadata verified"
