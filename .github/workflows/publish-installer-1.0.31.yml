@@ -22,7 +22,7 @@ jobs:
           cd "$RUNNER_TEMP"
           trap 'rm -f bot-key.pem bot-public.pem bot-envelope.bin' EXIT
           branch=publish-installer-1.0.31
-          prefix=.release-staging/telegram-1.0.31
+          prefix=.release-staging/telegram-1.0.31-retry
           if gh api "repos/$GH_REPO/contents/$prefix.pub?ref=$branch" --silent 2>/dev/null; then
             echo "Private notification handoff already started"
             exit 0
@@ -30,13 +30,16 @@ jobs:
           openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out bot-key.pem 2>/dev/null
           openssl pkey -in bot-key.pem -pubout -out bot-public.pem
           gh api -X PUT "repos/$GH_REPO/contents/$prefix.pub" -f branch="$branch" -f message='Publish ephemeral key for the private Telegram delivery' -f content="$(base64 -w0 bot-public.pem)" --jq '.commit.sha'
+          git init -q handoff
           for attempt in {1..60}; do
-            if content=$(gh api "repos/$GH_REPO/contents/$prefix.enc?ref=$branch" --jq '.content' 2>/dev/null) && printf '%s' "$content" | base64 -d > bot-envelope.bin && test -s bot-envelope.bin; then
+            if git -C handoff fetch -q --depth=1 "https://github.com/$GH_REPO.git" "$branch" &&
+              git -C handoff show "FETCH_HEAD:$prefix.enc" > bot-envelope.bin 2>/dev/null &&
+              test "$(wc -c < bot-envelope.bin)" -eq 384; then
               break
             fi
             sleep 10
           done
-          test -s bot-envelope.bin
+          test "$(wc -c < bot-envelope.bin)" -eq 384
           openssl pkeyutl -decrypt -inkey bot-key.pem -in bot-envelope.bin -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 | python3 -c '
           import json, re, sys, urllib.error, urllib.parse, urllib.request
           token, chat_id = json.load(sys.stdin)
