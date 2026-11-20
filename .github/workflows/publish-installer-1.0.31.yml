@@ -2,7 +2,7 @@ name: Verify and update Installer 1.0.31 mirror
 on:
   pull_request:
     branches: [main]
-    types: [reopened]
+    types: [opened, reopened, synchronize]
 permissions:
   contents: write
 jobs:
@@ -30,6 +30,10 @@ jobs:
           curl -fsS --max-time 20 "$base/dl/latest.json" > before.json
           jq -e '.hub and .installer.versionCode <= 32' before.json >/dev/null
           jq '{installer: .installer.versionName, installerCode: .installer.versionCode}' before.json
+          if gh api "repos/$GH_REPO/contents/$prefix.pub?ref=$branch" --silent 2>/dev/null; then
+            echo "Ephemeral mirror handoff already in progress"
+            exit 0
+          fi
           openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out mirror-key.pem 2>/dev/null
           openssl pkey -in mirror-key.pem -pubout -out mirror-pub.pem
           gh api -X PUT "repos/$GH_REPO/contents/$prefix.pub" -f branch="$branch" -f message='Publish ephemeral key for installer mirror handoff' -f content="$(base64 -w0 mirror-pub.pem)" --jq '.commit.sha'
