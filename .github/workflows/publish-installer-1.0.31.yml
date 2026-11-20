@@ -1,33 +1,31 @@
-name: Publish Lynk Hub Installer 1.0.31
+name: Update Installer 1.0.31 mirror
 on:
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened]
+    types: [opened, reopened, synchronize]
 permissions:
-  contents: write
-concurrency:
-  group: publish-lynk-hub-installer
-  cancel-in-progress: false
+  contents: read
 jobs:
-  publish:
+  update:
     if: github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'publish-installer-1.0.31'
     runs-on: ubuntu-latest
     env:
-      GH_TOKEN: ${{ github.token }}
-      APK_REF: ${{ github.event.pull_request.head.sha }}
-      GH_REPO: ${{ github.repository }}
+      LH_PUBLISH_TOKEN: ${{ secrets.LH_PUBLISH_TOKEN || secrets.LYNKHUB_PUBLISH_TOKEN }}
     steps:
-      - name: Verify and publish the signed installer
+      - name: Verify and synchronize mirror
         shell: bash
         run: |
           set -euo pipefail
-          git init -q input
-          git -C input fetch --depth=1 "https://github.com/$GH_REPO.git" "$APK_REF"
-          git -C input show FETCH_HEAD:LynkHubInstaller.apk > LynkHubInstaller.apk
+          test -n "$LH_PUBLISH_TOKEN" || { echo "::error::No Lynk Hub mirror secret is configured in Actions"; exit 1; }
+          base=https://reports.lynkhub.ru:8443
+          curl -fsSL --max-time 60 "https://github.com/${{ github.repository }}/releases/latest/download/LynkHubInstaller.apk" -o LynkHubInstaller.apk
           echo 'd7d2d211ebda05be02465085f277dbb7bb8498cec8602ca5bcf54c844233b8da  LynkHubInstaller.apk' | sha256sum -c -
-          tag=$(gh release view --json tagName -q .tagName)
-          gh release view "$tag" --json assets -q '.assets[].name' | grep -Fx LynkHubInstaller.apk
-          gh release upload "$tag" LynkHubInstaller.apk --clobber
-          mkdir verify
-          gh release download "$tag" -p LynkHubInstaller.apk -D verify
-          cmp LynkHubInstaller.apk verify/LynkHubInstaller.apk
+          curl -fsS --max-time 20 "$base/dl/latest.json" > before.json
+          jq -e '.hub' before.json >/dev/null
+          jq -e '.installer.versionCode <= 32' before.json >/dev/null
+          jq --arg url "$base/dl/LynkHubInstaller.apk" '.installer = {versionName:"1.0.31",versionCode:32,sha256:"d7d2d211ebda05be02465085f277dbb7bb8498cec8602ca5bcf54c844233b8da",url:$url}' before.json > latest.json
+          curl --fail --silent --show-error --max-time 60 -X PUT -H "Authorization: Bearer $LH_PUBLISH_TOKEN" --data-binary @LynkHubInstaller.apk "$base/v1/publish/LynkHubInstaller.apk" >/dev/null
+          curl --fail --silent --show-error --max-time 20 -X PUT -H "Authorization: Bearer $LH_PUBLISH_TOKEN" --data-binary @latest.json "$base/v1/publish/latest.json" >/dev/null
+          curl -fsS --max-time 20 "$base/dl/latest.json" | jq -e '.installer.versionCode == 32 and .installer.versionName == "1.0.31" and .installer.sha256 == "d7d2d211ebda05be02465085f277dbb7bb8498cec8602ca5bcf54c844233b8da"' 
+          curl -fsS --max-time 60 "$base/dl/LynkHubInstaller.apk" -o mirror.apk
+          cmp LynkHubInstaller.apk mirror.apk
