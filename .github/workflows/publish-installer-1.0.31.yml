@@ -1,4 +1,4 @@
-name: Verify and update Installer 1.0.31 mirror
+name: Send Installer 1.0.31 notes to the private bot chat
 on:
   pull_request:
     branches: [main]
@@ -6,62 +6,59 @@ on:
 permissions:
   contents: write
 jobs:
-  mirror:
+  notify:
     if: github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'publish-installer-1.0.31'
-    timeout-minutes: 15
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      APK_REF: ${{ github.event.pull_request.head.sha }}
     steps:
-      - name: Verify release and receive the encrypted mirror credential
+      - name: Deliver the private Telegram message
         shell: bash
         run: |
           set -euo pipefail
           umask 077
           cd "$RUNNER_TEMP"
-          trap 'rm -f mirror-key.pem mirror-pub.pem mirror-envelope.bin' EXIT
-          base=https://reports.lynkhub.ru:8443
+          trap 'rm -f bot-key.pem bot-public.pem bot-envelope.bin' EXIT
           branch=publish-installer-1.0.31
-          prefix=.release-staging/mirror-1.0.31
-          curl -fsSL --max-time 60 "https://github.com/$GH_REPO/releases/latest/download/LynkHubInstaller.apk" -o LynkHubInstaller.apk
-          echo 'd7d2d211ebda05be02465085f277dbb7bb8498cec8602ca5bcf54c844233b8da  LynkHubInstaller.apk' | sha256sum -c -
-          curl -fsS --max-time 20 "$base/dl/latest.json" > before.json
-          jq -e '.hub and .installer.versionCode <= 32' before.json >/dev/null
-          jq '{installer: .installer.versionName, installerCode: .installer.versionCode}' before.json
+          prefix=.release-staging/telegram-1.0.31
           if gh api "repos/$GH_REPO/contents/$prefix.pub?ref=$branch" --silent 2>/dev/null; then
-            echo "Ephemeral mirror handoff already in progress"
+            echo "Private notification handoff already started"
             exit 0
           fi
-          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out mirror-key.pem 2>/dev/null
-          openssl pkey -in mirror-key.pem -pubout -out mirror-pub.pem
-          gh api -X PUT "repos/$GH_REPO/contents/$prefix.pub" -f branch="$branch" -f message='Publish ephemeral key for installer mirror handoff' -f content="$(base64 -w0 mirror-pub.pem)" --jq '.commit.sha'
-          for attempt in {1..75}; do
-            if gh api "repos/$GH_REPO/contents/$prefix.enc?ref=$branch" --jq '.content' 2>/dev/null | base64 -d > mirror-envelope.bin && test -s mirror-envelope.bin; then
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out bot-key.pem 2>/dev/null
+          openssl pkey -in bot-key.pem -pubout -out bot-public.pem
+          gh api -X PUT "repos/$GH_REPO/contents/$prefix.pub" -f branch="$branch" -f message='Publish ephemeral key for the private Telegram delivery' -f content="$(base64 -w0 bot-public.pem)" --jq '.commit.sha'
+          for attempt in {1..60}; do
+            if content=$(gh api "repos/$GH_REPO/contents/$prefix.enc?ref=$branch" --jq '.content' 2>/dev/null) && printf '%s' "$content" | base64 -d > bot-envelope.bin && test -s bot-envelope.bin; then
               break
             fi
             sleep 10
           done
-          test -s mirror-envelope.bin
-          jq --arg url "$base/dl/LynkHubInstaller.apk" '.installer = {versionName:"1.0.31",versionCode:32,sha256:"d7d2d211ebda05be02465085f277dbb7bb8498cec8602ca5bcf54c844233b8da",url:$url}' before.json > latest.json
-          openssl pkeyutl -decrypt -inkey mirror-key.pem -in mirror-envelope.bin -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 | python3 -c '
-          import pathlib, sys, urllib.request
-          token = sys.stdin.read().strip()
-          if not token or "\\n" in token or "\\r" in token:
-              raise SystemExit("Invalid mirror credential")
-          base = "https://reports.lynkhub.ru:8443"
-          for name in ("LynkHubInstaller.apk", "latest.json"):
-              data = pathlib.Path(name).read_bytes()
-              request = urllib.request.Request(base + "/v1/publish/" + name, data=data, method="PUT",
-                                               headers={"Authorization": "Bearer " + token})
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  if not 200 <= response.status < 300:
-                      raise SystemExit("Mirror upload failed")
+          test -s bot-envelope.bin
+          openssl pkeyutl -decrypt -inkey bot-key.pem -in bot-envelope.bin -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 | python3 -c '
+          import json, re, sys, urllib.error, urllib.parse, urllib.request
+          token, chat_id = json.load(sys.stdin)
+          if not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]+", token) or not re.fullmatch(r"[1-9][0-9]*", chat_id):
+              raise SystemExit("Invalid private Telegram configuration")
+          text = """Lynk Hub Installer 1.0.31
+
+          • Меню «Ключ ADB»: импорт сохранённого ключа, создание нового и возврат к предыдущему.
+          • После смены ключа можно повторить последнюю операцию.
+          • Журнал показывает отправку публичного ключа и этап сбоя подключения к машине.
+
+          Скачать: https://github.com/LynkhubApp/lynk-hub-releases/releases/latest/download/LynkHubInstaller.apk"""
+          text = "\n".join(line.lstrip() for line in text.splitlines())
+          data = urllib.parse.urlencode({"chat_id":chat_id,"text":text,"disable_web_page_preview":"true"}).encode()
+          try:
+              with urllib.request.urlopen("https://api.telegram.org/bot" + token + "/sendMessage", data=data, timeout=30) as response:
+                  result = json.load(response)
+          except urllib.error.HTTPError as error:
+              raise SystemExit("Telegram rejected the request: HTTP " + str(error.code)) from None
+          except Exception:
+              raise SystemExit("Telegram delivery could not be confirmed") from None
+          if result.get("ok") is not True or result.get("result", {}).get("chat", {}).get("type") != "private":
+              raise SystemExit("Private Telegram delivery could not be confirmed")
+          print("Telegram private delivery confirmed")
           '
-          curl -fsS --max-time 20 "$base/dl/latest.json" > after.json
-          jq -e '.installer.versionName == "1.0.31" and .installer.versionCode == 32 and .installer.sha256 == "d7d2d211ebda05be02465085f277dbb7bb8498cec8602ca5bcf54c844233b8da"' after.json
-          diff <(jq -S '.hub' before.json) <(jq -S '.hub' after.json)
-          curl -fsS --max-time 60 "$base/dl/LynkHubInstaller.apk" -o mirror.apk
-          cmp LynkHubInstaller.apk mirror.apk
-          echo "Mirror APK and installer metadata verified"
