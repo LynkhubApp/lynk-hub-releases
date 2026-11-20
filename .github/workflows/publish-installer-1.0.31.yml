@@ -1,8 +1,8 @@
 name: Publish Lynk Hub Installer 1.0.31
 on:
-  push:
-    branches: [publish-installer-1.0.31]
-    paths: [LynkHubInstaller.apk]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
 permissions:
   contents: write
 concurrency:
@@ -10,16 +10,18 @@ concurrency:
   cancel-in-progress: false
 jobs:
   publish:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'publish-installer-1.0.31'
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
+      APK_REF: ${{ github.event.pull_request.head.sha }}
       GH_REPO: ${{ github.repository }}
     steps:
       - name: Verify and publish the signed installer
         shell: bash
         run: |
           set -euo pipefail
-          gh api -H 'Accept: application/vnd.github.raw+json' "repos/$GH_REPO/contents/LynkHubInstaller.apk?ref=$GITHUB_SHA" > LynkHubInstaller.apk
+          gh api -H 'Accept: application/vnd.github.raw+json' "repos/$GH_REPO/contents/LynkHubInstaller.apk?ref=$APK_REF" > LynkHubInstaller.apk
           echo 'd7d2d211ebda05be02465085f277dbb7bb8498cec8602ca5bcf54c844233b8da  LynkHubInstaller.apk' | sha256sum -c -
           tag=$(gh release view --json tagName -q .tagName)
           gh release view "$tag" --json assets -q '.assets[].name' | grep -Fx LynkHubInstaller.apk
@@ -27,4 +29,3 @@ jobs:
           mkdir verify
           gh release download "$tag" -p LynkHubInstaller.apk -D verify
           cmp LynkHubInstaller.apk verify/LynkHubInstaller.apk
-          gh api -X DELETE "repos/$GH_REPO/git/refs/heads/publish-installer-1.0.31"
